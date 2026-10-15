@@ -5,7 +5,6 @@ import os
 from typing import Dict, List, Optional, Set, Tuple, Any, cast
 
 import aiohttp
-import requests
 
 
 ###############################################################################
@@ -48,24 +47,27 @@ class Queries(object):
                     headers=headers,
                     json={"query": generated_query},
                 )
-            result = await r_async.json()
-            if result is not None:
-                return result
-        except:
-            print("aiohttp failed for GraphQL query")
-            # Fall back on non-async requests
-            async with self.semaphore:
-                r_requests = requests.post(
-                    "https://api.github.com/graphql",
-                    headers=headers,
-                    json={"query": generated_query},
+            if r_async.status != 200:
+                raise RuntimeError(
+                    f"GitHub GraphQL API returned HTTP {r_async.status}; "
+                    "verify ACCESS_TOKEN validity and permissions."
                 )
-                result = r_requests.json()
-                if result is not None:
-                    return result
-        return dict()
+            result = await r_async.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            raise RuntimeError(
+                "GitHub GraphQL request failed; check network connectivity."
+            ) from None
 
-    async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
+        if not isinstance(result, dict) or not isinstance(result.get("data"), dict):
+            raise RuntimeError("GitHub GraphQL API returned an unexpected response.")
+        if result.get("errors"):
+            raise RuntimeError(
+                "GitHub GraphQL API returned errors; verify ACCESS_TOKEN permissions "
+                "and rate limits."
+            )
+        return result
+
+    async def query_rest(self, path: str, params: Optional[Dict] = None) -> Any:
         """
         Make a request to the REST API
         :param path: API path to query
@@ -73,14 +75,12 @@ class Queries(object):
         :return: deserialized REST JSON output
         """
 
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        params = {} if params is None else params
+        if path.startswith("/"):
+            path = path[1:]
+
         for _ in range(60):
-            headers = {
-                "Authorization": f"token {self.access_token}",
-            }
-            if params is None:
-                params = dict()
-            if path.startswith("/"):
-                path = path[1:]
             try:
                 async with self.semaphore:
                     r_async = await self.session.get(
@@ -89,32 +89,46 @@ class Queries(object):
                         params=tuple(params.items()),
                     )
                 if r_async.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
                     await asyncio.sleep(2)
                     continue
-
-                result = await r_async.json()
-                if result is not None:
-                    return result
-            except:
-                print("aiohttp failed for rest query")
-                # Fall back on non-async requests
-                async with self.semaphore:
-                    r_requests = requests.get(
-                        f"https://api.github.com/{path}",
-                        headers=headers,
-                        params=tuple(params.items()),
+                response_headers = getattr(r_async, "headers", {})
+                rate_limited = r_async.status == 429 or (
+                    r_async.status == 403
+                    and (
+                        response_headers.get("Retry-After")
+                        or response_headers.get("X-RateLimit-Remaining") == "0"
                     )
-                    if r_requests.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    elif r_requests.status_code == 200:
-                        return r_requests.json()
-        # print(f"There were too many 202s. Data for {path} will be incomplete.")
-        print("There were too many 202s. Data for this repository will be incomplete.")
-        return dict()
+                )
+                if rate_limited:
+                    raise RuntimeError(
+                        "GitHub REST API rate limit exceeded; wait for the rate "
+                        "limit reset before rerunning."
+                    )
+                if path.endswith("/traffic/views") and r_async.status in (403, 404):
+                    print(
+                        "GitHub traffic views are unavailable for one or more "
+                        "repositories; those views were omitted."
+                    )
+                    return {}
+                if r_async.status != 200:
+                    raise RuntimeError(
+                        f"GitHub REST API returned HTTP {r_async.status}; verify "
+                        "ACCESS_TOKEN permissions, repository access, and rate limits."
+                    )
+                result = await r_async.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                raise RuntimeError(
+                    "GitHub REST API request failed; check network connectivity."
+                ) from None
+
+            if not isinstance(result, (dict, list)):
+                raise RuntimeError("GitHub REST API returned an unexpected response.")
+            return result
+
+        raise RuntimeError(
+            "GitHub is still calculating repository statistics after 120 seconds; "
+            "rerun the workflow later."
+        )
 
     @staticmethod
     def repos_overview(
@@ -324,30 +338,37 @@ Languages:
 
                 errors = raw_results.get("errors")
                 if errors:
-                    print("GraphQL errors while fetching repository stats:")
-                    for err in errors:
-                        print(f"  - {err.get('message', err)}")
-
-                self._name = (
-                    raw_results.get("data", {}).get("viewer", {}).get("name", None)
-                )
-                if self._name is None:
-                    self._name = (
-                        raw_results.get("data", {})
-                        .get("viewer", {})
-                        .get("login", "No Name")
+                    raise RuntimeError(
+                        "GitHub GraphQL API returned errors; verify ACCESS_TOKEN "
+                        "permissions and rate limits."
                     )
 
-                contrib_repos = (
-                    raw_results.get("data", {})
-                    .get("viewer", {})
-                    .get("repositoriesContributedTo", {})
-                )
-                owned_repos = (
-                    raw_results.get("data", {})
-                    .get("viewer", {})
-                    .get("repositories", {})
-                )
+                viewer = raw_results.get("data", {}).get("viewer")
+                if not isinstance(viewer, dict):
+                    raise RuntimeError(
+                        "GitHub GraphQL response omitted viewer data; verify "
+                        "ACCESS_TOKEN validity and permissions."
+                    )
+
+                self._name = viewer.get("name")
+                if self._name is None:
+                    self._name = viewer.get("login", "No Name")
+
+                contrib_repos = viewer.get("repositoriesContributedTo")
+                owned_repos = viewer.get("repositories")
+                if not isinstance(owned_repos, dict) or not isinstance(
+                    contrib_repos, dict
+                ):
+                    raise RuntimeError(
+                        "GitHub GraphQL response omitted repository data; verify "
+                        "ACCESS_TOKEN permissions and query limits."
+                    )
+                if not isinstance(owned_repos.get("nodes"), list) or not isinstance(
+                    contrib_repos.get("nodes"), list
+                ):
+                    raise RuntimeError(
+                        "GitHub GraphQL response contained invalid repository data."
+                    )
 
                 repos = owned_repos.get("nodes") or []
                 if not self._ignore_forked_repos:

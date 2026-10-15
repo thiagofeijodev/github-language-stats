@@ -94,8 +94,8 @@ For more information on inaccuracies, see issue
    Page](../../actions?query=workflow%3A"Generate+Stats+Images") and press "Run
    Workflow" on the right side of the screen to generate images for the first
    time. 
-   - The images will be automatically regenerated every 24 hours, but they can
-     be regenerated manually by running the workflow this way.
+   - The images will be automatically regenerated weekly (Sunday at 00:05 UTC),
+     but they can be regenerated manually by running the workflow this way.
 7. Take a look at the images that have been created in the
    [`generated`](generated) folder.
 8. To add your statistics to your GitHub Profile README, copy and paste the

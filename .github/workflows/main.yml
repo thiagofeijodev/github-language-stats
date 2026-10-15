@@ -12,15 +12,15 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
     # Check out repository under $GITHUB_WORKSPACE, so the job can access it
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v5
 
     # Run using Python 3.8 for consistency and aiohttp
     - name: Set up Python 3.8
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v6
       with:
         python-version: '3.8'
         architecture: 'x64'
@@ -31,6 +31,9 @@ jobs:
       run: |
         python3 -m pip install --upgrade pip setuptools wheel
         python3 -m pip install -r requirements.txt
+
+    - name: Run tests
+      run: python3 -m unittest discover -s tests -v
 
     # Generate all statistics images
     - name: Generate images
