@@ -91,6 +91,8 @@ class Queries(object):
                 if r_async.status == 202:
                     await asyncio.sleep(2)
                     continue
+                if r_async.status == 204 and path.endswith("/stats/contributors"):
+                    return []
                 response_headers = getattr(r_async, "headers", {})
                 rate_limited = r_async.status == 429 or (
                     r_async.status == 403

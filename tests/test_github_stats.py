@@ -67,6 +67,15 @@ class QueriesTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
             await queries.query_rest("/repos/owner/private-repository/stats/contributors")
 
+    async def test_empty_contributor_statistics_return_empty_list(self):
+        response = FakeResponse(204, None)
+        response.json = AsyncMock(side_effect=AssertionError("body must not be read"))
+        queries = Queries("user", "token", FakeSession(response))
+
+        result = await queries.query_rest("/repos/owner/project/stats/contributors")
+
+        self.assertEqual(result, [])
+
     async def test_unavailable_traffic_views_are_omitted(self):
         queries = Queries("user", "token", FakeSession(FakeResponse(404, {})))
 
