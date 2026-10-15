@@ -5,7 +5,6 @@ import os
 from typing import Dict, List, Optional, Set, Tuple, Any, cast
 
 import aiohttp
-import requests
 
 
 ###############################################################################
@@ -48,24 +47,27 @@ class Queries(object):
                     headers=headers,
                     json={"query": generated_query},
                 )
-            result = await r_async.json()
-            if result is not None:
-                return result
-        except:
-            print("aiohttp failed for GraphQL query")
-            # Fall back on non-async requests
-            async with self.semaphore:
-                r_requests = requests.post(
-                    "https://api.github.com/graphql",
-                    headers=headers,
-                    json={"query": generated_query},
+            if r_async.status != 200:
+                raise RuntimeError(
+                    f"GitHub GraphQL API returned HTTP {r_async.status}; "
+                    "verify ACCESS_TOKEN validity and permissions."
                 )
-                result = r_requests.json()
-                if result is not None:
-                    return result
-        return dict()
+            result = await r_async.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            raise RuntimeError(
+                "GitHub GraphQL request failed; check network connectivity."
+            ) from None
 
-    async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
+        if not isinstance(result, dict) or not isinstance(result.get("data"), dict):
+            raise RuntimeError("GitHub GraphQL API returned an unexpected response.")
+        if result.get("errors"):
+            raise RuntimeError(
+                "GitHub GraphQL API returned errors; verify ACCESS_TOKEN permissions "
+                "and rate limits."
+            )
+        return result
+
+    async def query_rest(self, path: str, params: Optional[Dict] = None) -> Any:
         """
         Make a request to the REST API
         :param path: API path to query
@@ -73,14 +75,12 @@ class Queries(object):
         :return: deserialized REST JSON output
         """
 
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        params = {} if params is None else params
+        if path.startswith("/"):
+            path = path[1:]
+
         for _ in range(60):
-            headers = {
-                "Authorization": f"token {self.access_token}",
-            }
-            if params is None:
-                params = dict()
-            if path.startswith("/"):
-                path = path[1:]
             try:
                 async with self.semaphore:
                     r_async = await self.session.get(
@@ -89,32 +89,48 @@ class Queries(object):
                         params=tuple(params.items()),
                     )
                 if r_async.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
                     await asyncio.sleep(2)
                     continue
-
-                result = await r_async.json()
-                if result is not None:
-                    return result
-            except:
-                print("aiohttp failed for rest query")
-                # Fall back on non-async requests
-                async with self.semaphore:
-                    r_requests = requests.get(
-                        f"https://api.github.com/{path}",
-                        headers=headers,
-                        params=tuple(params.items()),
+                if r_async.status == 204 and path.endswith("/stats/contributors"):
+                    return []
+                response_headers = getattr(r_async, "headers", {})
+                rate_limited = r_async.status == 429 or (
+                    r_async.status == 403
+                    and (
+                        response_headers.get("Retry-After")
+                        or response_headers.get("X-RateLimit-Remaining") == "0"
                     )
-                    if r_requests.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    elif r_requests.status_code == 200:
-                        return r_requests.json()
-        # print(f"There were too many 202s. Data for {path} will be incomplete.")
-        print("There were too many 202s. Data for this repository will be incomplete.")
-        return dict()
+                )
+                if rate_limited:
+                    raise RuntimeError(
+                        "GitHub REST API rate limit exceeded; wait for the rate "
+                        "limit reset before rerunning."
+                    )
+                if path.endswith("/traffic/views") and r_async.status in (403, 404):
+                    print(
+                        "GitHub traffic views are unavailable for one or more "
+                        "repositories; those views were omitted."
+                    )
+                    return {}
+                if r_async.status != 200:
+                    raise RuntimeError(
+                        f"GitHub REST API returned HTTP {r_async.status}; verify "
+                        "ACCESS_TOKEN permissions, repository access, and rate limits."
+                    )
+                result = await r_async.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                raise RuntimeError(
+                    "GitHub REST API request failed; check network connectivity."
+                ) from None
+
+            if not isinstance(result, (dict, list)):
+                raise RuntimeError("GitHub REST API returned an unexpected response.")
+            return result
+
+        raise RuntimeError(
+            "GitHub is still calculating repository statistics after 120 seconds; "
+            "rerun the workflow later."
+        )
 
     @staticmethod
     def repos_overview(
@@ -264,6 +280,8 @@ class Stats(object):
         self._exclude_repos = set() if exclude_repos is None else exclude_repos
         self._exclude_langs = set() if exclude_langs is None else exclude_langs
         self.queries = Queries(username, access_token, session)
+        self._stats_lock = asyncio.Lock()
+        self._stats_loaded = False
 
         self._name: Optional[str] = None
         self._stargazers: Optional[int] = None
@@ -299,95 +317,117 @@ Languages:
         """
         Get lots of summary statistics using one big query. Sets many attributes
         """
-        self._stargazers = 0
-        self._forks = 0
-        self._languages = dict()
-        self._repos = set()
+        async with self._stats_lock:
+            if self._stats_loaded:
+                return
 
-        exclude_langs_lower = {x.lower() for x in self._exclude_langs}
+            self._stargazers = 0
+            self._forks = 0
+            self._languages = dict()
+            self._repos = set()
 
-        next_owned = None
-        next_contrib = None
-        while True:
-            raw_results = await self.queries.query(
-                Queries.repos_overview(
-                    owned_cursor=next_owned, contrib_cursor=next_contrib
+            exclude_langs_lower = {x.lower() for x in self._exclude_langs}
+
+            next_owned = None
+            next_contrib = None
+            while True:
+                raw_results = await self.queries.query(
+                    Queries.repos_overview(
+                        owned_cursor=next_owned, contrib_cursor=next_contrib
+                    )
                 )
-            )
-            raw_results = raw_results if raw_results is not None else {}
+                raw_results = raw_results if raw_results is not None else {}
 
-            self._name = raw_results.get("data", {}).get("viewer", {}).get("name", None)
-            if self._name is None:
-                self._name = (
-                    raw_results.get("data", {})
-                    .get("viewer", {})
-                    .get("login", "No Name")
-                )
+                errors = raw_results.get("errors")
+                if errors:
+                    raise RuntimeError(
+                        "GitHub GraphQL API returned errors; verify ACCESS_TOKEN "
+                        "permissions and rate limits."
+                    )
 
-            contrib_repos = (
-                raw_results.get("data", {})
-                .get("viewer", {})
-                .get("repositoriesContributedTo", {})
-            )
-            owned_repos = (
-                raw_results.get("data", {}).get("viewer", {}).get("repositories", {})
-            )
+                viewer = raw_results.get("data", {}).get("viewer")
+                if not isinstance(viewer, dict):
+                    raise RuntimeError(
+                        "GitHub GraphQL response omitted viewer data; verify "
+                        "ACCESS_TOKEN validity and permissions."
+                    )
 
-            repos = owned_repos.get("nodes", [])
-            if not self._ignore_forked_repos:
-                repos += contrib_repos.get("nodes", [])
+                self._name = viewer.get("name")
+                if self._name is None:
+                    self._name = viewer.get("login", "No Name")
 
-            for repo in repos:
-                if repo is None:
-                    continue
-                name = repo.get("nameWithOwner")
-                if name in self._repos or name in self._exclude_repos:
-                    continue
-                self._repos.add(name)
-                self._stargazers += repo.get("stargazers").get("totalCount", 0)
-                self._forks += repo.get("forkCount", 0)
+                contrib_repos = viewer.get("repositoriesContributedTo")
+                owned_repos = viewer.get("repositories")
+                if not isinstance(owned_repos, dict) or not isinstance(
+                    contrib_repos, dict
+                ):
+                    raise RuntimeError(
+                        "GitHub GraphQL response omitted repository data; verify "
+                        "ACCESS_TOKEN permissions and query limits."
+                    )
+                if not isinstance(owned_repos.get("nodes"), list) or not isinstance(
+                    contrib_repos.get("nodes"), list
+                ):
+                    raise RuntimeError(
+                        "GitHub GraphQL response contained invalid repository data."
+                    )
 
-                for lang in repo.get("languages", {}).get("edges", []):
-                    name = lang.get("node", {}).get("name", "Other")
-                    languages = await self.languages
-                    if name.lower() in exclude_langs_lower:
+                repos = owned_repos.get("nodes") or []
+                if not self._ignore_forked_repos:
+                    repos += contrib_repos.get("nodes") or []
+
+                for repo in repos:
+                    if repo is None:
                         continue
-                    if name in languages:
-                        languages[name]["size"] += lang.get("size", 0)
-                        languages[name]["occurrences"] += 1
-                    else:
-                        languages[name] = {
-                            "size": lang.get("size", 0),
-                            "occurrences": 1,
-                            "color": lang.get("node", {}).get("color"),
-                        }
+                    name = repo.get("nameWithOwner")
+                    if name in self._repos or name in self._exclude_repos:
+                        continue
+                    self._repos.add(name)
+                    self._stargazers += repo.get("stargazers").get("totalCount", 0)
+                    self._forks += repo.get("forkCount", 0)
 
-            if owned_repos.get("pageInfo", {}).get(
-                "hasNextPage", False
-            ) or contrib_repos.get("pageInfo", {}).get("hasNextPage", False):
-                next_owned = owned_repos.get("pageInfo", {}).get(
-                    "endCursor", next_owned
-                )
-                next_contrib = contrib_repos.get("pageInfo", {}).get(
-                    "endCursor", next_contrib
-                )
-            else:
-                break
+                    for lang in repo.get("languages", {}).get("edges", []):
+                        lang_name = lang.get("node", {}).get("name", "Other")
+                        if lang_name.lower() in exclude_langs_lower:
+                            continue
+                        if lang_name in self._languages:
+                            self._languages[lang_name]["size"] += lang.get("size", 0)
+                            self._languages[lang_name]["occurrences"] += 1
+                        else:
+                            self._languages[lang_name] = {
+                                "size": lang.get("size", 0),
+                                "occurrences": 1,
+                                "color": lang.get("node", {}).get("color"),
+                            }
 
-        # TODO: Improve languages to scale by number of contributions to
-        #       specific filetypes
-        langs_total = sum([v.get("size", 0) for v in self._languages.values()])
-        for k, v in self._languages.items():
-            v["prop"] = 100 * (v.get("size", 0) / langs_total)
+                if owned_repos.get("pageInfo", {}).get(
+                    "hasNextPage", False
+                ) or contrib_repos.get("pageInfo", {}).get("hasNextPage", False):
+                    next_owned = owned_repos.get("pageInfo", {}).get(
+                        "endCursor", next_owned
+                    )
+                    next_contrib = contrib_repos.get("pageInfo", {}).get(
+                        "endCursor", next_contrib
+                    )
+                else:
+                    break
+
+            # TODO: Improve languages to scale by number of contributions to
+            #       specific filetypes
+            langs_total = sum([v.get("size", 0) for v in self._languages.values()])
+            if langs_total > 0:
+                for k, v in self._languages.items():
+                    v["prop"] = 100 * (v.get("size", 0) / langs_total)
+
+            self._stats_loaded = True
 
     @property
     async def name(self) -> str:
         """
         :return: GitHub user's name (e.g., Jacob Strieb)
         """
-        if self._name is not None:
-            return self._name
-        await self.get_stats()
+        if not self._stats_loaded:
+            await self.get_stats()
         assert self._name is not None
         return self._name
 
@@ -396,9 +436,8 @@ Languages:
         """
         :return: total number of stargazers on user's repos
         """
-        if self._stargazers is not None:
-            return self._stargazers
-        await self.get_stats()
+        if not self._stats_loaded:
+            await self.get_stats()
         assert self._stargazers is not None
         return self._stargazers
 
@@ -407,9 +446,8 @@ Languages:
         """
         :return: total number of forks on user's repos
         """
-        if self._forks is not None:
-            return self._forks
-        await self.get_stats()
+        if not self._stats_loaded:
+            await self.get_stats()
         assert self._forks is not None
         return self._forks
 
@@ -418,9 +456,8 @@ Languages:
         """
         :return: summary of languages used by the user
         """
-        if self._languages is not None:
-            return self._languages
-        await self.get_stats()
+        if not self._stats_loaded:
+            await self.get_stats()
         assert self._languages is not None
         return self._languages
 
@@ -429,9 +466,9 @@ Languages:
         """
         :return: summary of languages used by the user, with proportional usage
         """
-        if self._languages is None:
+        if not self._stats_loaded:
             await self.get_stats()
-            assert self._languages is not None
+        assert self._languages is not None
 
         return {k: v.get("prop", 0) for (k, v) in self._languages.items()}
 
@@ -440,9 +477,8 @@ Languages:
         """
         :return: list of names of user's repos
         """
-        if self._repos is not None:
-            return self._repos
-        await self.get_stats()
+        if not self._stats_loaded:
+            await self.get_stats()
         assert self._repos is not None
         return self._repos
 
